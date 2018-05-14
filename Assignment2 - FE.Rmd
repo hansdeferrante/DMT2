@@ -1,0 +1,319 @@
+---
+title: "Assignment 2 - Feature Engineering"
+author: "Hans"
+date: "May 4, 2018"
+output: html_document
+fig_width: 4
+fig_height: 3.5
+---
+
+We want to load the training and test data into a single joint dataframe. We run into trouble here as the intersection of search IDs between training and test data overlap, such that it will become difficult to do an appropriate splitting and also difficult to derive features over searches from a joint dataframe. Let us address this problem by adding 332.785 to each search_id from the test.df, which is the maximum index found in the training dataset. We should not forget to substract this number again after feature engineering.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(data.table)
+library(dplyr)
+
+# Load the training data with fread. 
+train.df <- fread('data/training_set_VU_DM_2014.csv', na.strings = c('NA','NULL'))
+test.df <- fread('data/test_set_VU_DM_2014.csv', na.strings = c('NA','NULL'))
+
+# Fix indices for test dataframe such that they do not overlap.
+maxTrainSrchId <- max(train.df$srch_id)
+test.df$srch_id <- test.df$srch_id + maxTrainSrchId
+print(paste0("Test srch_ids have been increased by ", maxTrainSrchId))
+
+# Data need to be assigned correct classes. Save columns that are really factors as such.
+header <-  names(train.df)
+compCols <- header[unlist(lapply(header, function(name) grepl('comp',name)))]
+booleanCols <- c('prop_brand_bool','promotion_flag','click_bool','booking_bool')
+identifierCols <- c('srch_id','site_id','visitor_location_country_id','prop_country_id','prop_id')
+factorCols <- c(booleanCols, identifierCols)
+
+# Discard features for which EDA showed that they are not really important.
+train.df[,(c(compCols,"date_time")) := NULL]   # Drop columns from train.
+test.df[,(c(compCols,"date_time")) := NULL]    # Drop them too from test.
+
+# Move information that does not changes across searches into a separate dataframe.
+unique.per.search <- c('site_id','visitor_location_country_id','visitor_hist_starrating','visitor_hist_adr_usd','prop_country_id',
+                      'srch_destination_id','srch_length_of_stay','srch_booking_window','srch_adults_count','srch_children_count',
+                      'srch_room_count','srch_saturday_night_bool','srch_query_affinity_score','random_bool')
+srch.df.train <- data.frame(srch_id=unique(train.df$srch_id)) %>% plyr::join(train.df[,c('srch_id', unique.per.search), with=F], 
+                                                                       by='srch_id', type="left",match="first")
+srch.df.test <- data.frame(srch_id=unique(test.df$srch_id)) %>% plyr::join(test.df[,c('srch_id', unique.per.search), with=F], 
+                                                                       by='srch_id', type="left",match="first")
+
+train.df$action <- ifelse(train.df$booking_bool==1, "booked", ifelse(train.df$click_bool==1, "clicked", "neither"))
+train.df$action <- as.factor(train.df$action)
+
+# Join train and test dataframes indicating whether it is train or test data.
+train.df$is.train <- T
+train.df$is.test <- F
+test.df$is.train <- F
+test.df$is.test <- T
+joint.df <- rbind(train.df, test.df, fill=T)
+rm(train.df)
+rm(test.df)
+
+# Remove unnecessary columns
+joint.df[,(unique.per.search) := NULL]   # Drop columns from train.
+joint.df$gross_bookings_usd <- NULL
+
+# Useful functions
+'%ni%' <- function(x,y)!('%in%'(x,y))
+fac2int <- function(fac) {return(as.integer(as.character(fac)))}
+```
+
+Within this document we too split training data further into a training and validation set. Let us do this by sampling from training observations. For feature engineering, we broadly follow EDA but we have to restrict some features to training set only, and cannot use test and validation set.
+
+```{r train/validation split}
+# Sample 5% of srch_ids from the training data. These will be set apart as validation data later.
+valfrac <- 0.05
+in.val <- sample(unique(joint.df[joint.df$is.train==T]$srch_id), valfrac*length(unique(joint.df[joint.df$is.train==T]$srch_id)))
+
+# Fix is.train and is.val labels. Is.val is true if it is validation, is.train is true if it is training. Test observations are neither.
+joint.df$is.val <- ifelse(joint.df$srch_id %in% in.val, T, F)
+joint.df$is.train <- ifelse(joint.df$srch_id %in% in.val, F, joint.df$is.train)
+
+# Also make a joint dataframe for the srch.df with booleans indicating if it is train or test.
+srch.df.train$is.val <- ifelse(srch.df.train$srch_id %in% in.val, T, F)
+srch.df.train$is.train <- ifelse(srch.df.train$srch_id %in% in.val, F, T)
+srch.df.train$is.test <- F
+srch.df.test$is.test <- T
+srch.df.test$is.train <- F
+srch.df.test$is.val <- F
+srch.df <- rbind(srch.df.train, srch.df.test)
+rm(srch.df.train)
+rm(srch.df.test)
+
+# Remove some stuff we don't use 
+joint.df$prop_log_historical_price <- NULL
+```
+
+# Feature engineering
+
+We have a dataframe with all data where we have columns indicating if it is test, train or validation data. Leakage of information of train to validation and train+validation to test needs to be prevented in feature engineering. Such leakage may occur for features that we define across properties (i.e. that summarize a statistic over the `prop_id`). We will deal with these feeatures in the block `property-based features`.
+
+## Engineering features per search
+
+Here, we summarize per search. We do this for all data.
+
+### Absolute deviation from median, Z-score (with median!) and price relative to the median.
+
+Here, we too filter out outliers based on price. Next, we construct
+- search-based features.
+- property-based features.
+- visitor-based features.
+
+```{r price-based features per search}
+# Append means, medians and standard deviations to srch.df
+srch.df <- joint.df[,c('srch_id', 'click_bool', 'booking_bool','price_usd')] %>%
+  group_by(srch_id) %>%
+  summarize(median_price_per_srch = median(price_usd), sd_price_per_srch = sd(price_usd)) %>%
+  plyr::join(srch.df, by="srch_id")
+
+# Find extremely priced searches. There are about 483 which have median prices over 10.000 USD or less than 20 USD. They occur in
+# train, validation and test data. This means we cannot simply discard them. Let us leave them for now and just compute the statistics.
+extremelyPricedSearches <- srch.df$srch_id[srch.df$median_price_per_srch>20000 | srch.df$median_price_per_srch<20]
+
+# Using the means, medians and standard deviations, compute a few statistics for each (srch_id, prop_id) pair. We work with pseudocounts to prevent infinity.
+joint.df <- joint.df %>%
+  merge(srch.df[c('srch_id','median_price_per_srch','sd_price_per_srch')], by='srch_id') %>%
+  mutate(z_score_per_srch = (price_usd-median_price_per_srch+.01)/(sd_price_per_srch+.01)) %>%     # Number of standard deviations from MEDIAN
+  mutate(priceMedianRatio_per_srch = (price_usd+.0001)/(median_price_per_srch+.0001)) %>%           # Price relative to the median price (median 
+                                                                                             #       is less sensitive to outliers)
+  mutate(deltaPriceMedian_per_srch = price_usd - median_price_per_srch) %>%                  # Difference price from median (in USD)
+  subset(select=-c(median_price_per_srch,sd_price_per_srch))
+```
+
+### Loc2-score based features.
+
+In the EDA, we saw that the loc2 score is associated with booking/clicking in that both:
+- NAs are associated with not being clicked on
+- Higher scores are associated with being clicked on/booked.
+
+The deviation from the median loc2 score per search can capture both effects. The classifier we use can't deal with NAs. Hence, let us also create a dummy that indicates whether the loc2 score is missing. Finally, add loc2 score per property id.
+
+```{r loc2-based features}
+joint.df <- joint.df %>% group_by(srch_id) %>%
+  mutate(medianLocScore = median(prop_location_score2, na.rm = T)) %>% ungroup() %>%  # Calculate search-based median loc score
+  mutate(devFromMedian_loc2 = prop_location_score2 - medianLocScore) %>%              # Calculate deviation from median per result
+  group_by(prop_id) %>%
+  mutate(medianLocScoreProp = median(prop_location_score2, na.rm = T)) %>%
+  subset(select=-c(medianLocScore))                                                   # Remove the median loc score
+
+joint.df$loc2score_NA <- ifelse(is.na(joint.df$devFromMedian_loc2), 1, 0)             # Dummy to indicate whether there is a loc2 score.
+
+# Remove stuff we don't need any longer.
+joint.df$prop_location_score2 <- NULL
+```
+
+### Review scores & stars
+
+The data description says that a review score of 0 indicates that no reviews have been given and NA that the information is not available. Let us combine these two into NA as a score of 0 for unreviewed properties does not respect ordering of number of stars given. Do the same for the star score.
+
+!! DON'T DO THIS ANYMORE; WE NEED NUMERICAL FEATURES FOR RANKLIB AND 0 CORRESPONDING TO NA IS STH NICE.
+
+```{r fixing number of stars, eval=FALSE, include=FALSE}
+joint.df <- joint.df %>% mutate(prop_review_score = ifelse(prop_review_score == 0, NA, prop_review_score))
+joint.df <- joint.df %>% mutate(prop_starrating = ifelse(prop_starrating == 0, NA, prop_starrating))
+```
+
+## Engineering visitor-based features
+
+For about 1/4th of all searches, history of the customer is present in the training data w.r.t. previous bookings star ratings and previous bookings prices. Even though it is missing very often, we think it may still be useful to include features that compare these figures to the star rating of the hotel and the price of the hotel. The price of the hotel is quite complicated as we don't know in which units they are given. Hence, we will not include this for now.
+
+!! Star rating doesn't add much; missing for 9 million search results (0 in prop_starrating indicates it is unknown).
+
+```{r history starratings, eval=FALSE, include=FALSE}
+joint.df <- merge(joint.df, srch.df[c("srch_id","visitor_hist_starrating")], by = "srch_id") %>% 
+  mutate(starDiffPreviousBookings = prop_starrating - visitor_hist_starrating) %>%
+  subset(select=-c(visitor_hist_starrating))
+```
+
+###### Removing stuff that's no longer needed and clear memory ######
+
+```{r}
+srch.df[c("sd_price_per_srch", "site_id", "visitor_location_country_id","visitor_hist_starrating",
+          "random_bool")] <- NULL
+joint.df$orig_destination_distance <- NULL
+gc()
+```
+
+## Engineering property-based features
+
+Here, we engineer features based on property-ids. To come up with a fair validation set, we are not allowed to use features for the validation set.
+
+### Percentage clicks/bookings that include kids
+
+We think there is a relationship between properties people book and whether they are taking children. Let us find per property the propensity have children if we know the property is clicked/booked. We need to ensure we don't use information from the validation set, otherwise we have information leakage.
+
+```{r number of children}
+# Append number of children in search to dataframe.
+joint.df <- plyr::join(as.data.frame(joint.df), srch.df[c('srch_id','srch_children_count')], by = c('srch_id'))
+
+# Calculate propensities of having children per property.
+propensitiesPerProp <- joint.df %>%
+  filter(is.train == T) %>%                                                   # Only use information from training set.
+  filter(action == 'booked' | action == 'clicked') %>%                        # Consider only bookings and clicks
+  group_by(prop_id) %>% filter(n() >= 3) %>%                                    # For all properties with at least 3 bookings/clicks
+  summarize(pastPropensityChildren = sum(srch_children_count > 0, na.rm=T)/n())        # Calculate propensity of having children
+  
+# Merge training dataframe to the propensities.
+joint.df <- plyr::join(joint.df, propensitiesPerProp, by=c("prop_id"))
+rm(propensitiesPerProp) 
+```
+
+### Fraction clicked on/booked in all training data & prices
+
+```{r price per property}
+# Construct a dataframe where we summarize the prices per property. We can do this for all data.
+property.df <- joint.df %>% 
+  group_by(prop_id) %>%
+  summarize(median_price_prop = median(price_usd), sd_price_prop = sd(price_usd))
+
+# For training data only, summarize the mean times the property is clicked and booked. Then join it to the property.df
+property.df <- joint.df %>% filter(is.train == T) %>% group_by(prop_id) %>% 
+  summarize(frac_booked_prop = mean(fac2int(booking_bool)),
+            frac_clicked_prop = mean(fac2int(click_bool))) %>%
+  plyr::join(property.df, by=c("prop_id"), type="right") 
+```
+
+# Removing stuff we don't need and "imputing" missing values
+
+Here, we remove some features that seem uninteresting and also add some features from srch.df that are of interest.
+
+```{r rounding up}
+# Define the target
+joint.df$target <- ifelse(joint.df$action == "booked", 5, ifelse(joint.df$action == "clicked", 1, ifelse(joint.df$action == "neither", 0, NA)))
+joint.df$action <- NULL
+joint.df$position <- NULL
+```
+
+Let us fill in the missing values. This is necessary as ranklib cannot deal with NAs.
+
+```{r imputing NAs}
+
+# On a per search basis.
+srch.df$visitor_hist_adr_usd[is.na(srch.df$visitor_hist_adr_usd)] <- median(srch.df$visitor_hist_adr_usd, na.rm = T)
+srch.df$srch_query_affinity_score[is.na(srch.df$srch_query_affinity_score)] <- 0
+
+# For joint dataframe.
+joint.df$prop_starrating[is.na(joint.df$prop_starrating)] <- -1
+joint.df$prop_review_score[is.na(joint.df$prop_review_score)] <- -1
+joint.df$devFromMedian_loc2[is.na(joint.df$devFromMedian_loc2)] <- median(joint.df$devFromMedian_loc2, na.rm = T)
+joint.df$pastPropensityChildren[is.na(joint.df$pastPropensityChildren)] <- median(joint.df$pastPropensityChildren, na.rm = T)
+joint.df$medianLocScoreProp[is.na(joint.df$medianLocScoreProp)] <- -1
+```
+
+# Writing out stuff.
+
+Write out the training set. Property-based features will be defined here since we get memory errors if we try to save it in memory...
+
+```{r write to file}
+# training data
+joint.df %>% filter(is.train == T) %>% 
+  plyr::join(srch.df[c("srch_id","median_price_per_srch",                                   # Join search-based features.
+                       "prop_country_id", "srch_saturday_night_bool","srch_room_count",
+                       "srch_length_of_stay","srch_adults_count")]) %>%
+  plyr::join(property.df, by="prop_id") %>%                                                 
+  mutate(z_score_prop = (price_usd - median_price_prop)/sd_price_prop,                      # Join property-based features
+         priceMedianRatio_prop = price_usd/median(price_usd),
+         deltaPriceMedian_prop = price_usd - median_price_prop) %>%
+  subset(select=-c(median_price_prop, sd_price_prop, is.train, is.test, is.val, booking_bool, click_bool)) %>%
+  fwrite("data/traindf_withfeatures.csv")
+
+# validation data
+joint.df %>% filter(is.val == T) %>% 
+  plyr::join(srch.df[c("srch_id","median_price_per_srch",                                   # Join search-based features.
+                       "prop_country_id", "srch_saturday_night_bool","srch_room_count",
+                       "srch_length_of_stay","srch_adults_count")]) %>%
+  plyr::join(property.df, by="prop_id") %>%                                                 
+  mutate(z_score_prop = (price_usd - median_price_prop)/sd_price_prop,                      # Join property-based features
+         priceMedianRatio_prop = price_usd/median(price_usd),
+         deltaPriceMedian_prop = price_usd - median_price_prop) %>%
+  subset(select=-c(median_price_prop, sd_price_prop, is.train, is.test, is.val, booking_bool, click_bool)) %>%
+  fwrite("data/valdf_withfeatures.csv")
+
+# test data
+joint.df %>% filter(is.test == T) %>% 
+  mutate(srch_id = srch_id - maxTrainSrchId) %>%                                            # ORIGINAL SRCH INDEX
+  plyr::join(srch.df[c("srch_id","median_price_per_srch",                                   # Join search-based features.
+                       "prop_country_id", "srch_saturday_night_bool","srch_room_count",
+                       "srch_length_of_stay","srch_adults_count")]) %>%
+  plyr::join(property.df, by="prop_id") %>%                                                 
+  mutate(z_score_prop = (price_usd - median_price_prop)/sd_price_prop,                      # Join property-based features
+         priceMedianRatio_prop = price_usd/median(price_usd),
+         deltaPriceMedian_prop = price_usd - median_price_prop) %>%
+  subset(select=-c(median_price_prop, sd_price_prop, is.train, is.test, is.val, booking_bool, click_bool)) %>%
+  fwrite("data/testdf_withfeatures.csv")
+```
+
+# Downsampling training data.
+
+Let us downsample the rows that are neither clicked nor booked to at most 10 for training data. This may significantly speed up training. Validation and test set will remain intact.
+
+```{r downsampling train, eval=FALSE, include=FALSE}
+set.seed(64177)
+
+# Remove all non-training observations; they will not be needed anymore.
+joint.df <- fread("data/traindf_withfeatures.csv")
+
+# Among the not booked and not clicked on obs. with at least 10 counts, these are the combinations of srch_ids and prop_ids we want to maintain.
+selectedCombinations <- joint.df %>% filter(target == 0) %>% 
+  group_by(srch_id) %>%
+  filter(n()>=10) %>%
+  sample_n(10) %>%
+  subset(select=c("srch_id","prop_id")) %>%
+  as.data.frame()
+
+# Do an anti-join to find out which columns ought to be removed from those with at least 10 non-conversions.
+notSelectedCombinations <- joint.df %>% filter(target == 0) %>%
+  group_by(srch_id) %>% filter(n()>=10) %>%
+  subset(select=c("srch_id","prop_id")) %>%
+  anti_join(selectedCombinations, by = c("srch_id", "prop_id"))
+
+# Remove the not selected combinations from the training set and write to file.
+joint.df %>% anti_join(notSelectedCombinations, by=c("srch_id", "prop_id")) %>% 
+  fwrite("data/downsampled_traindf_withfeatures.csv")
+```

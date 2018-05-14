@@ -1,0 +1,65 @@
+---
+title: "Assignment 2 - Learning"
+author: "Hans"
+date: "May 5, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(data.table)
+library(dplyr)
+```
+
+# RankLib
+
+Initially, an implementation in the `gbm` package and `xgboost` was pursued with pairwise ranking and the ndcg measure. However, both packages suffer from problems in that they try to minimize the ndcg which obviously should be maximized. On Kaggle, users have reported that the ranklib package could be used. Hence, let us try ranklib.
+
+We wrote a little python script to write it to ranklib format. It also scrambles the rows so that we can get a good idea of a baseline for the NDCG score.
+
+```{r data preparation}
+system("cd /media/hans/DATA/DMT2/Assignment\\ 2/; /home/hans/anaconda3/bin/python csvToSVMLight.py -f data/traindf_withfeatures.csv -s 139")
+system("cd /media/hans/DATA/DMT2/Assignment\\ 2/; /home/hans/anaconda3/bin/python csvToSVMLight.py -f data/downsampled_traindf_withfeatures.csv -s 14")
+system("cd /media/hans/DATA/DMT2/Assignment\\ 2/; /home/hans/anaconda3/bin/python csvToSVMLight.py -f data/valdf_withfeatures.csv -s 1")
+system("cd /media/hans/DATA/DMT2/Assignment\\ 2/; /home/hans/anaconda3/bin/python csvToSVMLight.py -f data/testdf_withfeatures.csv -s 5100")
+```
+
+# Training using RankLib
+
+A slower learning rate is virtually always better. Flip side is that learning takes longer and algorithm may terminate early. To prevent the latter, increase early stopping. 
+
+```{r training with all training observations (ranklib) }
+# With all training data and checking on validation data
+system("cd /media/hans/DATA/DMT2/Assignment\\ 2/; java -Xmx3072m -jar RankLib-2.9.jar -train data/traindf_withfeatures.rlf -validate data/valdf_withfeatures.rlf -save output/model.mdl -ranker 6 -metric2t NDCG@38 -mls 50 -leaf 20 -tree 10000 -shrinkage .005 -estop 500 > output/training_output_full.txt")
+```
+
+Also for downsampling training observations.
+
+```{r, training with subset of training sample (ranklib)}
+# With training data where irrelevant results are downsampled on training data
+system("cd /media/hans/DATA/DMT2/Assignment\\ 2/; java -Xmx3072m -jar RankLib-2.9.jar -train data/downsampled_traindf_withfeatures.rlf -validate data/valdf_withfeatures.rlf -save output/model_ds.mdl -ranker 6 -metric2t NDCG@38 -mls 50 -leaf 20 -tree 10000 -shrinkage .005 -estop 500 > output/training_output_downsampled.txt")
+```
+
+Note that this NDCG@38 score was obtained after scrambling the rows and leakage of information from train to validation was prevented. Hence, it should be a good benchmark of the NDCG we hope to attain for test data. It also motivates further use of ranklib software as it simply shows that it works (where we could not get gbm or xgboost to work).
+
+```{r comparing performance on validation set to baseline and across models}
+system("cd /media/hans/DATA/DMT2/Assignment\\ 2/; java -jar RankLib-2.9.jar -test data/valdf_withfeatures.rlf -metric2T NDCG@38 -idv output/baseline.ndcg.txt")
+system("cd /media/hans/DATA/DMT2/Assignment\\ 2/; java -jar RankLib-2.9.jar -load output/model.mdl -test data/valdf_withfeatures.rlf -metric2T NDCG@38 -idv output/model.ndcg.txt")
+system("cd /media/hans/DATA/DMT2/Assignment\\ 2/; java -jar RankLib-2.9.jar -load output/model_ds.mdl -test data/valdf_withfeatures.rlf -metric2T NDCG@38 -idv output/model_ds.ndcg.txt")
+```
+
+# Ranking test observations
+
+```{r ranking the test observations}
+system("cd /media/hans/DATA/DMT2/Assignment\\ 2/; java -Xmx3072m -jar RankLib-2.9.jar -load output/model.mdl -rank data/testdf_withfeatures.rlf -score deliverables/myscorefile.txt")
+```
+
+```{r eval=FALSE, include=FALSE}
+results <- data.frame(fread("deliverables/myscorefile.txt"), prop_id = fread("data/testdf_withfeatures_properties.txt"))
+names(results) <- c("SearchId","result","score", "PropertyId")
+results <- results %>% arrange(SearchId, -score)
+results[c("result","score")] <- NULL
+fwrite(results,"submissionFormatTest.csv")
+```
+
+

@@ -1,0 +1,350 @@
+---
+title: "Assignment2"
+author: "H.C. de Ferrante"
+date: "30 april 2018"
+output:
+  html_document: default
+  pdf_document: default
+fig_width: 4
+fig_height: 3.5
+---
+
+In setup, load the training data. Note that missing values are saved as "NULL" in the dataset. The dataset is extremely large. Therefore, we use `fread` from `datetable` for loading and `fastPOSIXct` to convert to a date object.
+
+Also, to reduce the memory footprint of this code, split up dataframes into (i) a dataframe for searches with information that is constant across searches and (ii) a dataframe with as IDs (srch_id, prop_id) where information changes.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(data.table)
+library(dplyr)
+library(fasttime)
+library(ggplot2)
+library(viridis)
+
+# This function is useful to define as the NOT IN operator.
+'%ni%' <- function(x,y)!('%in%'(x,y))
+```
+
+```{r load data for EDA}
+# Load the training data with fread. 
+train.df <- fread('data/training_set_VU_DM_2014.csv', na.strings = c('NA','NULL'))
+
+# Data need to be assigned correct classes. Save columns that are really factors as such.
+header <-  names(train.df)
+compCols <- header[unlist(lapply(header, function(name) grepl('comp',name)))]
+booleanCols <- c('prop_brand_bool','promotion_flag','click_bool','booking_bool')
+identifierCols <- c('srch_id','site_id','visitor_location_country_id','prop_country_id','prop_id')
+factorCols <- c(compCols, booleanCols, identifierCols)
+train.df <- train.df[, (factorCols):= lapply(.SD, factor), .SDcols=factorCols]
+
+# Move information that does not changes across searches into a separate dataframe.
+unique.per.search <- c('site_id','date_time','visitor_location_country_id','visitor_hist_starrating','visitor_hist_adr_usd','prop_country_id',
+                      'srch_destination_id','srch_length_of_stay','srch_booking_window','srch_adults_count','srch_children_count',
+                      'srch_room_count','srch_saturday_night_bool','srch_query_affinity_score','random_bool')
+srch.df <- data.frame(srch_id=unique(train.df$srch_id)) %>% plyr::join(train.df[,c('srch_id', unique.per.search), with=F], 
+                                                                       by='srch_id', type="left",match="first")
+srch.df$date_time <- fasttime::fastPOSIXct(srch.df$date_time)
+train.df[,(unique.per.search) := NULL]   # Drop columns from train.
+```
+
+# EDA
+
+Here, we provide some summary of statistics for booleans
+
+```{r some initial statistics}
+summary(train.df[,booleanCols,with=F])
+```
+
+## Properties of the dependent variable (clicks, bookings and number of properties per search)
+
+The most important statistics in the table above are `click_bool` and `booking_bool`. These show that approximately 2.8% of the search results result in bookings and approximately 4.5% of the search results are clicked on. Thus, there is quite a severe imbalance in the response.
+
+```{r statistics per search}
+fac2int <- function(fac) {return(as.integer(as.character(fac)))}
+
+# Merge a summary of the number of properties listed per search, the number of clicks and the number of bookings to the srch_df
+srch.df <- train.df[,c('srch_id', 'click_bool', 'booking_bool')] %>%
+  group_by(srch_id) %>%
+  mutate(click_bool = fac2int(click_bool), booking_bool = fac2int(booking_bool)) %>%
+  summarize(number_of_properties = n(), number_of_clicks = sum(click_bool), number_of_bookings = sum(booking_bool)) %>%
+  merge(srch.df, by="srch_id")
+
+srch.df[,c('number_of_properties', 'number_of_clicks', 'number_of_bookings')] %>% summary()
+```
+
+According to the summary above, the majority of people click on only a single property (every search has at least 1 click and >75% of the searches has only 1 click (see `3rd Qu.` of `number_of_clicks`). If a property is booked from a search, it is always one property (the maximum of `number_of_bookings` is 1). That a property is booked is not a given since the mean number of bookings is .69, not 1. Most variation is in the number of properties displayed by Expedia.
+
+### Histogram of bookings, clicks and number of properties per search.
+
+Let us visualize this as well.
+
+```{r histograms, fig.height=3, fig.width=4}
+plot <- srch.df %>% subset(select=c('srch_id','number_of_properties', 'number_of_clicks', 'number_of_bookings')) %>% 
+  melt(id='srch_id') %>%
+  group_by(variable, value) %>%
+  summarize(perc = 100*n()/dim(srch.df)[1]) %>%
+  ggplot(aes(x=value, y=perc, fill = variable)) +
+  geom_col(position='identity', color = 'black', alpha = .3) +
+  theme_classic() +
+  theme(legend.position='top', legend.title = element_blank()) + 
+  scale_fill_manual(values=c('red','green3','blue'), 
+                       name=NA,
+                       breaks=c("number_of_properties", "number_of_clicks", "number_of_bookings"),
+                       labels=c("Properties", "Clicks", "Bookings")) +
+  xlab('Count per search') +
+  ylab('Percentage')
+
+ggsave('figs/SummaryOfStatistics.pdf', plot = plot, width=4, height=3.5, device=pdf)
+plot <- NULL
+```
+
+## Pricing 
+
+Obviously, economic reasoning would argue that whether a person clicks/books a property depends on the price of hotel stay. Let us first look at a summary of statistics of prices as it is not without problems.
+
+```{r generating price statistics}
+# Append means, medians and standard deviations to srch.df
+srch.df <- train.df[,c('srch_id', 'click_bool', 'booking_bool','price_usd')] %>%
+  group_by(srch_id) %>%
+  summarize(mean_price_per_srch = mean(price_usd), median_price_per_srch = median(price_usd), sd_price_per_srch = sd(price_usd)) %>%
+  plyr::join(srch.df, by="srch_id")
+
+# Using the means, medians and standard deviations, compute a few statistics for each (srch_id, prop_id) pair.
+train.df <- train.df[,c('srch_id', 'prop_id', 'price_usd')] %>%
+  merge(srch.df[c('srch_id','mean_price_per_srch','median_price_per_srch','sd_price_per_srch')], by='srch_id') %>%
+  mutate(z_score = (price_usd-median_price_per_srch)/sd_price_per_srch) %>%     # Number of standard deviations from MEDIAN
+  mutate(frac = price_usd/median_price_per_srch) %>%                            # Price relative to the median price (median 
+                                                                                #             is more sensitive to outliers)
+  mutate(deltaPriceMedian = price_usd - median_price_per_srch) %>%              # Difference price from median (in USD)
+  subset(select=-c(price_usd,mean_price_per_srch,median_price_per_srch,sd_price_per_srch)) %>%
+  merge(train.df, by=c("srch_id","prop_id"))
+
+
+# Assign a variable "action" which indicates whether a property was clicked, booked or neither.
+train.df$action <- ifelse(train.df$booking_bool==1, "booked", ifelse(train.df$click_bool==1, "clicked", "neither"))
+train.df$action <- as.factor(train.df$action)
+
+print("Some statistics for prices in USD")
+summary(train.df$price_usd)
+
+print("The 100 highest prices")
+head(sort(train.df$price_usd, decreasing=T), 100)
+```
+
+According to this summary, the maximum price found here is about 20 million USD, and the minimum price is 0. There are also more than 100 properties showing up with prices over a million USD. This seems to point clearly towards an issue with prices. If we calculate the median price per summary (not shown) the maximum median price is approximately 2.5 million USD and there are many searches with median prices of 1 million USD. Let us inspect some of these searches.
+
+```{r table of highest median prices, eval=FALSE, include=FALSE}
+# 100 searches with highest median price. Display some other stuff as well.
+srch.df %>% group_by(srch_id) %>% 
+  subset(select=c(srch_id, number_of_bookings, number_of_clicks, srch_adults_count, srch_children_count, visitor_location_country_id, site_id, srch_destination_id, median_price_per_srch, srch_length_of_stay)) %>%
+  arrange(-median_price_per_srch) %>% head(100)
+```
+
+Inspecting the metadata for the search, we see that searches with extremely high prices generally do have bookings. They are fairly well distributed across time, site IDs and visitor locations and countries; it is unlikely that it is a conversion problem from e.g. JPY to USD. What is striking that the bookers do not book for very long stays and book typically for 2-5 people. Hence, it seems very unlikely that the prices for these searches were displayed correctly (most expensive hotels in the world go for ~20.000 USD a night). If the median price is per night, the median result that pops up for some night exceeds 5 million USD. Clearly, something is wrong here.
+
+This brings us to the matter of how to deal with these type of searches. Let us restrict models to searches that have median prices not exceeding 10.000 USD. This is somewhat arbitrary but it just doesn't seem right that these prices are so high, especially considering that these hotels are booked through Expedia. Something similar is holding for extremely low prices. Let us restrict median prices to at least 20 USD. It means we lose about 200/200.000 observations, which is about .1%.
+
+Maybe this is not such a good idea considering that the test data will also probably have such observations. We don't want these observations to muddy our waters, however.
+
+```{r}
+# Delete entire searches based on median prices
+extremelyPricedSearches <- srch.df$srch_id[srch.df$median_price_per_srch>10000 | srch.df$median_price_per_srch<20]
+train.df <- train.df[train.df$srch_id %ni% extremelyPricedSearches, ] 
+srch.df <- srch.df[srch.df$srch_id %ni% extremelyPricedSearches, ]
+extremelyPricedSearches <- NULL
+```
+
+### Histogram relative price hotel for booked/clicked properties
+
+Let us investigate if there is a pattern in the type of hotels users book with regards to whether a hotel is relatively expensive or relatively inexpensive. There are several ways to do this and how price differences could affect users propensities to click or book. These include:
+- Whether prices are significantly lower/higher (SDs away from the mean)
+- Absolute deviations from the median.
+- Price relative to median price
+
+Note, significantly lower prices may matter more e.g. if the mean and standard deviation of price are relatively large. The absolute price may be motivated from prospect theory. The price relative to the median can be motivated by the Z-score not being a good measure if standard deviation is low, and lower prices are only marginally less expensive than normal prices.
+
+```{r deviation from price, fig.height=3.5, fig.width=10}
+# Create histograms for booked, clicked and neither.
+plot <- train.df %>% subset(select=c('srch_id', 'z_score','frac','deltaPriceMedian','action')) %>%
+  filter(frac < 5) %>%                                        # Extremely low fractions can occur for small fractions
+  filter(abs(deltaPriceMedian) < 300) %>%                     # Some outliers for million USD prices remain.
+  melt(c('srch_id','action')) %>%
+  ggplot(aes(value, ..density.., fill = action)) +
+  geom_histogram(position = 'dodge', alpha = .5) +
+  ylab('Density') +
+  facet_wrap( ~ variable, scales="free",
+              strip.position = "bottom",
+              labeller = as_labeller(c(z_score = "SDs from median", frac = "Price relative to median", deltaPriceMedian = "Absolute difference from median price"))) +
+  theme_classic() +
+  theme(legend.position = 'top', legend.title = element_blank(),
+        strip.background = element_blank(), strip.placement = "outside")
+
+ggsave('figs/RelativePriceFig.pdf', plot = plot, width=9, height=3.5, device=pdf)
+plot <- NULL
+```
+
+The figure confirms expectations that properties that are inexpensive are more often clicked on and booked than properties that are expensive with regards to all three price properties. That is, we see that properties that are significantly less expensive are more often booked, properties that are around or below the median price are more often clicked/booked and finally, properties that are cheaper than the mean in EUR are more often booked.
+
+### Correlation promotions and competitor prices with booking/clicking.
+
+Here, we first have a brief look at competitor prices. For 8 distinct competitors, we have if their rate is lower, availability, and the percentage difference in the rate. On the Kaggle page, it is mentioned `comp1_inv` is a factor which has value 1 if it is unavailable at the competitor and 0 if both have availability. However, the data shows a third factor -1. 
+
+Extrapolating from the information above, one would expect that -1 corresponds to inavailability at Expedia and availability at the competitor. This turns out not to be the case as there are properties that are booked and whose `comp_inv` is -1. E.g. for competitor 5, there are in the training data 4072 properties that are booked at Expedia for which `comp_inv_5` is 1, 969 properties for which it is -1, and about 62.000 properties for which it is 0. Thus, meaning of `comp_inv` is problematic.
+
+Apart from these qualitative problems, we can also simply inspect the pairwise correlations. Let us do this for the three competitors for which we have most data (or equivalently, least missing data).
+
+```{r}
+# To inspect which competitors we should look at. Reorder the columns
+lapply(train.df[c(compCols)], function(col) sum(is.na(col))) %>% unlist() %>% sort()
+selectedCols <- lapply(c('2','5','8'), function(num) compCols[grepl(num,compCols)]) %>% unlist()
+selectedCols <- selectedCols[lapply(1:3, function(start) seq(start,9,3)) %>% unlist()]
+
+# Derive the correlation matrix.
+meltedCorMatrix <- sapply(train.df[c('click_bool','booking_bool',selectedCols)], as.numeric) %>%
+  as.matrix() %>%
+  cor(use='pairwise.complete.obs', method="spearman") %>%
+  melt()
+
+# Plot pairwise correlations
+ggplot(meltedCorMatrix, aes(x=Var1, y=Var2, fill=value)) +
+  geom_tile() +
+  scale_fill_viridis() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, size = 12, hjust = 1),
+       axis.title = element_blank(),
+       legend.title = element_text("Spearman correlation"))
+```
+
+The pairwise complete correlations show that there are almost no correlations between booking/clicking and information from the competitors. Hence, let us discard any competitor information.
+
+### Correlation promotions and competitor prices with booking/clicking.
+
+Finally, check whether there is significant overlap between being booked/clicked on. The figure shows that the properties with a promotion flag indeed got booked a little more often. Thus, it seems reasonable to keep the promotion flag.
+
+```{r}
+train.df[c('promotion_flag','action')] %>%
+  group_by(action, promotion_flag) %>%
+  summarize(total = n()) %>%
+  group_by(action) %>%
+  mutate(total_action = sum(total), perc = total/total_action) %>%
+  ggplot(aes(x=action, y=perc, fill = promotion_flag)) +
+  geom_col()
+```
+
+## Hotel properties
+
+Here, we will look at properties that are characteristic for hotels.
+
+### Stars
+
+Here we plot the number of stars and booking propensities. We see that the propensity of booking increases somewhat in the range of 3.5 - 4.5 stars. 5-star hotels are not as often booked or clicked. 
+
+```{r}
+# Replace 0's by NAs. If we use 0s the ordinal scale of prop_review_score is compromised.
+train.df <- train.df %>% mutate(prop_review_score = ifelse(prop_review_score == 0, NA, prop_review_score))
+
+# Make the plot.
+plot <- train.df[c("action","prop_review_score")] %>%
+  ggplot(aes(x=prop_review_score, fill = action)) +
+  geom_bar(position="fill", color='black', alpha = .4) +
+  scale_y_continuous(labels = scales::percent) +
+  xlab("Number of stars") +
+  ylab("Propensities") +
+  theme_classic() +
+  theme(legend.position = "top", legend.title=element_blank())
+ggsave('figs/Stars.pdf', plot = plot, width=4, height=3.5, device=pdf)
+```
+
+### Hotel location
+
+Perhaps the most important property is its location. We will look at both types of location scores and see if it correlates significantly with booking/clicking. The first location score varies from 0 to 1, the second from 0 to 6.98. Also look at their pairwise correlations. We also check whether properties reoccur often, otherwise using this type of data is not useful.
+
+```{r}
+# Select needed data.
+train.df[,c('srch_id', 'click_bool', 'booking_bool','prop_location_score1','prop_location_score2','prop_id')]
+
+# Derive the percentage of times a property is booked/clicked of its total appearances and its total appearances. 
+train.df <- train.df[,c('srch_id', 'click_bool', 'booking_bool','prop_id')] %>%
+  group_by(prop_id) %>%
+  mutate(perc_appearances_booked = mean(fac2int(booking_bool)), perc_appearances_clicked = mean(fac2int(click_bool)), times_appeared = n()) %>%
+  subset(select=c('srch_id','prop_id','perc_appearances_booked','perc_appearances_clicked')) %>%
+  merge(train.df, by = c("srch_id","prop_id"))
+
+plot <- train.df %>%
+  subset(select=c('prop_id','perc_appearances_booked','perc_appearances_clicked')) %>% 
+  group_by(prop_id) %>% filter(row_number()==1, n()>=5) %>%     #Filter to one observation per property, and properties booked at least 5 times.
+  melt('prop_id') %>%
+  ggplot(aes(x=value, fill=variable)) +
+  geom_histogram(bins = 40, position='identity', alpha = .4, color = 'black') +
+  scale_fill_discrete(name  = "BookOrClick",
+                            breaks=c("perc_appearances_booked", "perc_appearances_clicked"),
+                            labels=c("Booked", "Clicked")) +
+  xlab("Percentage appearances clicked/booked") +
+  ylab("Number of distinct properties") +
+  theme(legend.position = "top", legend.title=element_blank()) + 
+  theme_classic()
+
+# Save the plot
+ggsave('figs/OftenBookedProperties.pdf', plot = plot, width=4, height=3.5, device=pdf)
+plot <- NULL
+```
+
+Now look at correlations between location scores and booking
+
+```{r correllogram location scores & booking}
+# Make a correllogram for locations and booking percentages
+meltedCorMatrix <- train.df[c('perc_appearances_clicked','perc_appearances_booked','prop_location_score1','prop_location_score2')] %>% cor(use="pairwise.complete.obs") %>% melt()
+ggplot(meltedCorMatrix, aes(x=Var1, y=Var2, fill=value)) +
+  geom_tile() +
+  scale_fill_viridis() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, size = 12, hjust = 1),
+       axis.title = element_blank())
+```
+
+The first plot establishes that some properties are simply more often booked than other properties, and quite many properties have never been booked before. Hence, use of booking history in training set seems reasonable. The second plot shows that the first location score has almost zero correlation with bookings and clicks, whereas the second location score has some correlation with being booked. One reason why the second location score matters is that it is desirable for the user itself, e.g. if the user has looked for a hotel in a certain neighborhood on Expedia.
+
+Checking this shows that this idea does not hold; it is not the case that for a given search all property location 2 scores are NA or a certain value. All in all, for about 20% of data the score is not available. Also, we have no reason to believe NAs should be interpreted as 0s as 0s are present for the scores.
+
+In any case, NAs are associated with not being clicked or booked and higher loc2 scores are associated with higher propensities to be booked/clicked. 
+
+```{r histogram median deviation loc2 score}
+# Plotting densities of deviation from median per action
+plot <- train.df[c("srch_id","prop_location_score2","action")] %>% group_by(srch_id) %>%
+  mutate(medianLocScore = median(prop_location_score2, na.rm = T), devFromMedian_locScore2 = prop_location_score2 - medianLocScore) %>%
+  subset(select=c(srch_id, devFromMedian_locScore2, action)) %>%
+  ggplot(aes(x=devFromMedian_locScore2, fill=action)) +
+  geom_histogram(aes(y=..density..), bins = 40, position='identity', alpha = .4, color = 'black') +
+  scale_x_continuous(limits=c(-.5,.5)) +
+  xlab("Deviation from median loc2 score per search") +
+  ylab("Density") +
+  theme(legend.position = "top", legend.title=element_blank()) + 
+  theme_classic()
+ggsave('figs/locScoreMedianDev.pdf', plot = plot, width=4, height=3.5, device=pdf)
+
+# Plotting density of NA counts per action.
+plot <- train.df[c("srch_id","prop_location_score2","action")] %>% group_by(srch_id) %>%
+  mutate(loc2score = ifelse(is.na(prop_location_score2), F, T)) %>%
+  ggplot(aes(x=action, fill = loc2score)) +
+  geom_bar(position="fill", alpha = .4, color = 'black') +
+  scale_fill_discrete(name  = "BookOrClick",
+                      breaks=c("FALSE", "TRUE"),
+                      labels=c("Location score 2 absent", "present")) +
+  scale_y_continuous(labels = scales::percent) +
+  ylab("Percentage") +
+  theme_classic() +
+  theme(legend.position = "top", legend.title=element_blank())
+ggsave('figs/locScoreNA.pdf', plot = plot, width=4, height=3.5, device=pdf)
+```
+
+
+
+## Wrapping-up the EDA.
+
+We have found
+- Correlation between inexpensive properties and being booked/clicked
+- Some extreme prices that can are filtered out (about .1% of total searches)
+- Location score 2 seems to be important, location score 1 is not.
+- Promotion flag seems to have some importance, but not much.
+- Competitor prices seem (almost) useless.
+- Some properties are simply booked relatively more often than other properties. It seems reasonable to therefore use how often a property is booked as a feature too.
+
+Some other stuff we could check but will leave for now are properties related to the visitor (e.g. kids, previous spending, previous ratings). Also, we haven't explored many properties w.r.t. hotel except for locations (e.g. rating)
